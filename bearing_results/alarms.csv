@@ -1,0 +1,13 @@
+﻿bearing,n_records,expected,missing_minutes,baseline_ok,H,V,OR,AND,injected_onset
+S1_dual,720,720,,1,394,406,394,406,361
+S1_healthy,720,720,,1,,,,,
+S1_horizontal,720,720,,1,395,,395,,361
+S1_transient,720,720,,1,,,,,
+S2_dual,720,720,,1,394,404,394,404,361
+S2_healthy,720,720,,1,,,,,
+S2_horizontal,720,720,,1,394,,394,,361
+S2_transient,720,720,,1,,,,,
+S3_dual,720,720,,1,393,405,393,405,361
+S3_healthy,720,720,,1,,,,,
+S3_horizontal,720,720,,1,393,,393,,361
+S3_transient,720,720,,1,,,,,
