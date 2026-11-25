@@ -97,7 +97,8 @@ class AnalysisTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as directory:
             destination = export_result(result, directory)
             self.assertEqual({p.name for p in destination.iterdir()},
-                             {"waveform.csv", "spectrum.csv", "metrics.csv", "parameters.txt"})
+                             {"waveform.csv", "spectrum.csv", "psd.csv", "stft.csv",
+                              "metrics.csv", "parameters.txt"})
             restored_t, restored_x, fs, source = load_csv(destination / "waveform.csv", 1, 3, 1)
             np.testing.assert_array_equal(restored_x, result.processed)
             np.testing.assert_array_equal(restored_t, result.time)
