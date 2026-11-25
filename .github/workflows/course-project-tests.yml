@@ -2,9 +2,13 @@ name: Python tests
 
 on:
   push:
-    branches: [main, course-project-simplification]
+    branches:
+      - main
+      - course-project-simplification
+      - course-project-clean
   pull_request:
-    branches: [main]
+    branches:
+      - main
 
 jobs:
   test:
