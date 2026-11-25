@@ -1,4 +1,4 @@
-﻿# Python cache
+# Python cache
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -8,17 +8,18 @@ __pycache__/
 venv/
 env/
 
-# Local database
+# Local databases and generated experiment outputs
 *.db
 *.sqlite
 *.sqlite3
+result_*/
 
 # Sensitive configuration
 .env
 .env.*
 !.env.example
 
-# Original datasets
+# Optional external datasets (not required by this project)
 XJTU-SY/
 datasets/
 dataset/
