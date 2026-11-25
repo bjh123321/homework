@@ -1,4 +1,4 @@
-"""Vibration signal generation, analysis, CSV input and result export."""
+"""Core algorithms for the vibration-signal virtual instrument."""
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from datetime import datetime
@@ -8,6 +8,7 @@ import math
 import os
 import shutil
 import tempfile
+
 import numpy as np
 from scipy import signal, ndimage
 
@@ -38,6 +39,7 @@ class ProcessingConfig:
     cutoff: float = 180.0
     order: int = 4
     window_size: int = 11
+    remove_trend: bool = False
 
 
 @dataclass
@@ -53,6 +55,13 @@ class AnalysisResult:
     fs: float
     source: dict
     processing: ProcessingConfig
+    welch_frequency: np.ndarray
+    raw_psd: np.ndarray
+    processed_psd: np.ndarray
+    stft_frequency: np.ndarray
+    stft_time: np.ndarray
+    raw_stft_magnitude: np.ndarray
+    processed_stft_magnitude: np.ndarray
 
 
 def positive(value, label):
@@ -80,13 +89,17 @@ def checked_signal(values, fs):
 
 
 def generate(config):
+    """Generate a reproducible multi-tone vibration signal with optional impulses."""
     fs = positive(config.fs, "采样率")
     count = fs * positive(config.duration, "时长")
     if not math.isfinite(count) or not 4 <= count <= MAX_SAMPLES:
         raise ValueError(f"采样率×时长须在 4～{MAX_SAMPLES} 之间")
     count = int(round(count))
-    pairs = [(config.amplitude1, config.frequency1), (config.amplitude2, config.frequency2),
-             (config.interference_amplitude, config.interference_frequency)]
+    pairs = [
+        (config.amplitude1, config.frequency1),
+        (config.amplitude2, config.frequency2),
+        (config.interference_amplitude, config.interference_frequency),
+    ]
     for amplitude, frequency in pairs:
         if not math.isfinite(amplitude) or abs(amplitude) > 1e50:
             raise ValueError("正弦幅值须有限且绝对值不大于 1e50")
@@ -98,9 +111,13 @@ def generate(config):
         raise ValueError("脉冲幅值须有限且绝对值不大于 1e50")
     if not math.isfinite(config.pulse_probability) or not 0 <= config.pulse_probability <= 1:
         raise ValueError("脉冲概率须在 0～1 之间")
+
     rng = np.random.default_rng(integer(config.seed, "随机种子", 0, 2**32 - 1))
     time = np.arange(count) / fs
-    data = sum(amplitude * np.sin(2 * np.pi * frequency * time) for amplitude, frequency in pairs)
+    data = sum(
+        amplitude * np.sin(2 * np.pi * frequency * time)
+        for amplitude, frequency in pairs
+    )
     data += rng.normal(0, config.noise_std, count)
     if config.pulse_enabled:
         mask = rng.random(count) < config.pulse_probability
@@ -109,11 +126,12 @@ def generate(config):
 
 
 def load_csv(path, fs, value_column=1, time_column=0):
-    """One-based column selection. A zero time column uses the supplied fs."""
+    """Read a single-channel CSV. Column numbers are one-based; time_column=0 uses fs."""
     value_column = integer(value_column, "幅值列", 1, 10000)
     time_column = integer(time_column, "时间列", 0, 10000)
     if value_column == time_column:
         raise ValueError("幅值列与时间列必须不同")
+
     values, times = [], []
     first = True
     with Path(path).open(encoding="utf-8-sig", newline="") as stream:
@@ -138,6 +156,7 @@ def load_csv(path, fs, value_column=1, time_column=0):
                 times.append(numbers[1])
             if len(values) > MAX_SAMPLES:
                 raise ValueError(f"样本数超过 {MAX_SAMPLES}")
+
     if time_column:
         time = np.asarray(times, dtype=float)
         if len(time) < 4 or not np.all(np.isfinite(time)):
@@ -150,15 +169,24 @@ def load_csv(path, fs, value_column=1, time_column=0):
     else:
         fs = positive(fs, "采样率")
         time = np.arange(len(values)) / fs
+
     data = checked_signal(values, fs)
-    return time, data, fs, {"type": "csv", "path": str(Path(path).resolve()),
-                            "value_column": value_column, "time_column": time_column}
+    return time, data, fs, {
+        "type": "csv",
+        "path": str(Path(path).resolve()),
+        "value_column": value_column,
+        "time_column": time_column,
+    }
 
 
 def process(data, fs, config):
+    """Apply optional detrending/de-meaning and one selected filter."""
     output = checked_signal(data, fs)
+    if config.remove_trend:
+        output = signal.detrend(output, type="linear")
     if config.remove_mean:
         output -= output.mean()
+
     if config.filter_method == "butterworth":
         cutoff = positive(config.cutoff, "截止频率")
         if cutoff >= fs / 2:
@@ -183,71 +211,154 @@ def process(data, fs, config):
 
 
 def amplitude_spectrum(data, fs):
+    """Return a one-sided peak-amplitude spectrum from the real FFT."""
+    data = checked_signal(data, fs)
     n = len(data)
     amplitude = np.abs(np.fft.rfft(data)) / n
-    amplitude[1:-1 if n % 2 == 0 else None] *= 2
+    if n % 2 == 0:
+        amplitude[1:-1] *= 2
+    else:
+        amplitude[1:] *= 2
     return np.fft.rfftfreq(n, 1 / fs), amplitude
 
 
 def metrics(data, frequency, spectrum):
     centered = data - data.mean()
-    variance = float(np.mean(centered**2))
-    rms = float(np.sqrt(np.mean(data**2)))
+    variance = float(np.mean(centered ** 2))
+    rms = float(np.sqrt(np.mean(data ** 2)))
     mean_abs = float(np.mean(np.abs(data)))
     index = int(np.argmax(spectrum[1:])) + 1
-    return {"mean": float(data.mean()), "std": float(np.sqrt(variance)), "rms": rms,
-            "absolute_peak": float(np.max(np.abs(data))), "peak_to_peak": float(np.ptp(data)),
-            "kurtosis": float(np.mean(centered**4) / variance**2) if variance > 0 else math.nan,
-            "shape_factor": rms / mean_abs if mean_abs > 0 else math.nan,
-            "dominant_frequency_hz": float(frequency[index]) if variance > 0 and spectrum[index] > 0 else math.nan,
-            "dominant_amplitude": float(spectrum[index]) if variance > 0 else 0.0}
+    return {
+        "mean": float(data.mean()),
+        "std": float(np.sqrt(variance)),
+        "rms": rms,
+        "absolute_peak": float(np.max(np.abs(data))),
+        "peak_to_peak": float(np.ptp(data)),
+        "kurtosis": float(np.mean(centered ** 4) / variance ** 2) if variance > 0 else math.nan,
+        "shape_factor": rms / mean_abs if mean_abs > 0 else math.nan,
+        "dominant_frequency_hz": float(frequency[index])
+        if variance > 0 and spectrum[index] > 0 else math.nan,
+        "dominant_amplitude": float(spectrum[index]) if variance > 0 else 0.0,
+    }
 
 
 def analyze(time, data, fs, source, config):
+    """Calculate time-domain metrics, FFT, Welch PSD and STFT for both signals."""
     raw = checked_signal(data, fs)
     time = np.array(time, dtype=float, copy=True)
     if time.shape != raw.shape or not np.all(np.isfinite(time)):
         raise ValueError("时间轴与信号不匹配")
     if not np.allclose(np.diff(time), 1 / fs, rtol=1e-4, atol=1e-10 / fs):
         raise ValueError("时间轴与采样率不匹配")
+
     processed = process(raw, fs, config)
     frequency, raw_spectrum = amplitude_spectrum(raw, fs)
     _, processed_spectrum = amplitude_spectrum(processed, fs)
-    return AnalysisResult(time, raw, processed, frequency, raw_spectrum, processed_spectrum,
-                          metrics(raw, frequency, raw_spectrum), metrics(processed, frequency, processed_spectrum),
-                          fs, source, config)
+    raw_metrics = metrics(raw, frequency, raw_spectrum)
+    processed_metrics = metrics(processed, frequency, processed_spectrum)
+
+    welch_nperseg = min(1024, len(raw))
+    welch_frequency, raw_psd = signal.welch(
+        raw, fs=fs, window="hann", nperseg=welch_nperseg,
+        noverlap=welch_nperseg // 2, scaling="density"
+    )
+    _, processed_psd = signal.welch(
+        processed, fs=fs, window="hann", nperseg=welch_nperseg,
+        noverlap=welch_nperseg // 2, scaling="density"
+    )
+
+    stft_nperseg = min(256, len(raw))
+    stft_noverlap = min(int(stft_nperseg * 0.75), stft_nperseg - 1)
+    stft_frequency, stft_time, raw_stft = signal.stft(
+        raw, fs=fs, window="hann", nperseg=stft_nperseg,
+        noverlap=stft_noverlap, boundary=None, padded=False
+    )
+    _, _, processed_stft = signal.stft(
+        processed, fs=fs, window="hann", nperseg=stft_nperseg,
+        noverlap=stft_noverlap, boundary=None, padded=False
+    )
+
+    return AnalysisResult(
+        time, raw, processed, frequency, raw_spectrum, processed_spectrum,
+        raw_metrics, processed_metrics, fs, source, config,
+        welch_frequency, raw_psd, processed_psd,
+        stft_frequency, stft_time, np.abs(raw_stft), np.abs(processed_stft)
+    )
 
 
 def export_result(result, parent):
-    """Publish a complete result directory after all four files have been written."""
+    """Export numerical results and processing metadata into a new folder."""
     parent = Path(parent)
     parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=".vibration-", dir=parent))
     destination = parent / ("result_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
     try:
-        np.savetxt(temporary / "waveform.csv", np.column_stack([result.time, result.raw, result.processed]),
-                   delimiter=",", header="time_s,raw,processed", comments="", fmt="%.17g", encoding="utf-8-sig")
-        np.savetxt(temporary / "spectrum.csv",
-                   np.column_stack([result.frequency, result.raw_spectrum, result.processed_spectrum]),
-                   delimiter=",", header="frequency_hz,raw_peak_amplitude,processed_peak_amplitude",
-                   comments="", fmt="%.17g", encoding="utf-8-sig")
+        np.savetxt(
+            temporary / "waveform.csv",
+            np.column_stack([result.time, result.raw, result.processed]),
+            delimiter=",", header="time_s,raw,processed", comments="",
+            fmt="%.17g", encoding="utf-8-sig"
+        )
+        np.savetxt(
+            temporary / "spectrum.csv",
+            np.column_stack([result.frequency, result.raw_spectrum, result.processed_spectrum]),
+            delimiter=",", header="frequency_hz,raw_peak_amplitude,processed_peak_amplitude",
+            comments="", fmt="%.17g", encoding="utf-8-sig"
+        )
+        np.savetxt(
+            temporary / "psd.csv",
+            np.column_stack([result.welch_frequency, result.raw_psd, result.processed_psd]),
+            delimiter=",", header="frequency_hz,raw_psd,processed_psd",
+            comments="", fmt="%.17g", encoding="utf-8-sig"
+        )
+        time_grid, frequency_grid = np.meshgrid(result.stft_time, result.stft_frequency)
+        np.savetxt(
+            temporary / "stft.csv",
+            np.column_stack([
+                time_grid.ravel(), frequency_grid.ravel(),
+                result.raw_stft_magnitude.ravel(), result.processed_stft_magnitude.ravel()
+            ]),
+            delimiter=",", header="time_s,frequency_hz,raw_magnitude,processed_magnitude",
+            comments="", fmt="%.17g", encoding="utf-8-sig"
+        )
         with (temporary / "metrics.csv").open("w", encoding="utf-8-sig", newline="") as stream:
             writer = csv.writer(stream)
             writer.writerow(["metric", "raw", "processed"])
             for name in result.raw_metrics:
                 writer.writerow([name, result.raw_metrics[name], result.processed_metrics[name]])
-        parameters = {"created_at": datetime.now().astimezone().isoformat(), "fs_hz": result.fs,
-                      "sample_count": len(result.raw), "record_duration_s": len(result.raw) / result.fs,
-                      "source": result.source, "processing": asdict(result.processing),
-                      "definitions": {"std": "population, ddof=0", "kurtosis": "central moment, Gaussian=3",
-                                      "shape_factor": "RMS / mean(abs(x))", "undefined": "nan",
-                                      "spectrum": "rectangular window, one-sided peak amplitude",
-                                      "dominant_frequency": "largest bin excluding DC, no interpolation",
-                                      "butterworth": "zero-phase forward/backward sosfiltfilt",
-                                      "window_boundary": "reflect"}}
-        (temporary / "parameters.txt").write_text(json.dumps(parameters, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        parameters = {
+            "created_at": datetime.now().astimezone().isoformat(),
+            "fs_hz": result.fs,
+            "sample_count": len(result.raw),
+            "record_duration_s": len(result.raw) / result.fs,
+            "source": result.source,
+            "processing": asdict(result.processing),
+            "welch": {
+                "window": "hann", "nperseg": min(1024, len(result.raw)),
+                "noverlap": min(1024, len(result.raw)) // 2, "scaling": "density"
+            },
+            "stft": {
+                "window": "hann", "nperseg": min(256, len(result.raw)),
+                "overlap_ratio": 0.75, "boundary": None, "padded": False
+            },
+            "definitions": {
+                "std": "population, ddof=0",
+                "kurtosis": "central moment, Gaussian=3",
+                "shape_factor": "RMS / mean(abs(x))",
+                "fft": "rectangular window, one-sided peak amplitude",
+                "welch": "Hann window, 50 percent overlap, PSD density",
+                "stft": "Hann window, 75 percent overlap, magnitude",
+                "dominant_frequency": "largest FFT bin excluding DC, no interpolation",
+                "butterworth": "zero-phase forward/backward SOS filtering",
+                "window_boundary": "reflect",
+            },
+        }
+        (temporary / "parameters.txt").write_text(
+            json.dumps(parameters, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         os.rename(temporary, destination)
     except Exception:
-        shutil.rmtree(temporary)
+        shutil.rmtree(temporary, ignore_errors=True)
         raise
     return destination

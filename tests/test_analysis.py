@@ -116,3 +116,51 @@ class AnalysisTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AdvancedAnalysisTests(unittest.TestCase):
+    def test_linear_detrend_removes_linear_component(self):
+        fs = 1000
+        time = np.arange(1000) / fs
+        data = np.sin(2 * np.pi * 10 * time) + 0.5 * time
+        result = process(
+            data, fs,
+            ProcessingConfig(remove_mean=True, filter_method="none", remove_trend=True)
+        )
+        slope = np.polyfit(time, result, 1)[0]
+        self.assertAlmostEqual(slope, 0.0, places=8)
+
+    def test_welch_and_stft_products(self):
+        fs = 2000
+        time = np.arange(4000) / fs
+        data = np.sin(2 * np.pi * 50 * time) + 0.3 * np.sin(2 * np.pi * 400 * time)
+        result = analyze(
+            time, data, fs, {"type": "test"}, ProcessingConfig(False, "none")
+        )
+        peak = result.welch_frequency[np.argmax(result.raw_psd)]
+        self.assertLess(abs(peak - 50), 5)
+        self.assertEqual(
+            result.raw_stft_magnitude.shape, result.processed_stft_magnitude.shape
+        )
+        self.assertEqual(
+            result.raw_stft_magnitude.shape,
+            (len(result.stft_frequency), len(result.stft_time))
+        )
+        self.assertGreater(result.raw_psd.max(), 0)
+        self.assertGreater(result.processed_psd.max(), 0)
+
+    def test_export_contains_psd_stft_and_parameters(self):
+        time, data = generate(GeneratorConfig())
+        result = analyze(
+            time, data, 2000, {"type": "test"}, ProcessingConfig()
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            destination = export_result(result, directory)
+            expected = {
+                "waveform.csv", "spectrum.csv", "psd.csv",
+                "stft.csv", "metrics.csv", "parameters.txt",
+            }
+            self.assertEqual({p.name for p in destination.iterdir()}, expected)
+            parameters = (destination / "parameters.txt").read_text(encoding="utf-8")
+            self.assertIn('"sample_count": 4000', parameters)
+            self.assertIn('"stft"', parameters)
